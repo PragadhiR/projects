@@ -282,6 +282,63 @@ function computeDisability(audiogram: AudiogramData): DisabilityEstimate {
   };
 }
 
+/**
+ * Severity score (0-100).
+ *
+ * Derived directly from the worse ear's three-frequency PTA rather than a
+ * random value. 0 dB HL maps to 0, and 105 dB HL (deep into the profound
+ * range) maps to 100, with values in between scaled linearly and clamped.
+ * This gives a continuous severity measure that moves predictably with the
+ * actual input thresholds instead of jittering between runs.
+ */
+const severityFromPta = (worsePta: number): number =>
+  Math.round(Math.max(0, Math.min(100, (worsePta / 105) * 100)));
+
+/**
+ * Confidence score (0-100).
+ *
+ * Reflects how clean and decisive the classification is, based on two
+ * real signals instead of randomness:
+ *
+ * 1. Boundary margin - how far each ear's PTA sits from the nearest
+ *    degree-grading cutoff (25/40/55/70/90 dB HL). A PTA sitting right on
+ *    a boundary is inherently more ambiguous to grade than one solidly
+ *    within a band, so confidence dips near boundaries.
+ * 2. Threshold smoothness - real audiograms vary gradually across adjacent
+ *    frequencies. Large frequency-to-frequency jumps (>20 dB) suggest an
+ *    unusual configuration or inconsistent data entry, which should lower
+ *    confidence in the automated pattern/degree call.
+ *
+ * The result is clamped to a 60-99 range: never absolute certainty (this is
+ * a heuristic engine, not a validated diagnostic device), never below a
+ * floor that would undermine every result.
+ */
+const DEGREE_BOUNDARIES = [25, 40, 55, 70, 90];
+
+const boundaryMargin = (pta: number): number => {
+  const distance = Math.min(...DEGREE_BOUNDARIES.map((b) => Math.abs(pta - b)));
+  return Math.min(1, distance / 12);
+};
+
+const thresholdSmoothness = (t: EarThresholds): number => {
+  const freqs: Frequency[] = [250, 500, 1000, 2000, 4000, 8000];
+  const jumps = freqs.slice(1).map((f, i) => Math.abs(t[f] - t[freqs[i]]));
+  const maxJump = Math.max(...jumps);
+  return Math.max(0, 1 - Math.max(0, maxJump - 20) / 40);
+};
+
+const computeConfidence = (
+  left: EarThresholds,
+  right: EarThresholds,
+  leftPta: number,
+  rightPta: number,
+): number => {
+  const margin = (boundaryMargin(leftPta) + boundaryMargin(rightPta)) / 2;
+  const smoothness = (thresholdSmoothness(left) + thresholdSmoothness(right)) / 2;
+  const score = 75 + margin * 15 + smoothness * 9;
+  return Math.round(Math.max(60, Math.min(99, score)));
+};
+
 const deriveOverall = (left: EarAnalysis, right: EarAnalysis) => {
   const bilateral =
     left.degree !== 'Normal' && right.degree !== 'Normal';
@@ -330,9 +387,9 @@ export function diagnose(audiogram: AudiogramData): DiagnosisResult {
   const right = analyzeEar(audiogram.right);
   const overall = deriveOverall(left, right);
 
-  const maxDegree = Math.max(degreeIndex(left.degree), degreeIndex(right.degree));
-  const severityScore = Math.min(100, Math.round((maxDegree / 5) * 92 + Math.random() * 8));
-  const confidence = Math.round(88 + Math.random() * 9);
+  const worsePta = Math.max(left.pta, right.pta);
+  const severityScore = severityFromPta(worsePta);
+  const confidence = computeConfidence(audiogram.left, audiogram.right, left.pta, right.pta);
 
   return {
     left,
